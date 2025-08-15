@@ -15,13 +15,71 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 warnings.filterwarnings('ignore')
 
-# 한글 폰트 등록 (Windows 기준)
+# 한글 폰트 등록 (크로스 플랫폼 지원)
+def setup_korean_font():
+    """한글 폰트를 설정합니다. 여러 환경을 지원합니다."""
+    import platform
+    import os
+    
+    # 가능한 폰트 경로들
+    font_paths = []
+    
+    system = platform.system()
+    if system == "Windows":
+        font_paths = [
+            'C:/Windows/Fonts/malgun.ttf',
+            'C:/Windows/Fonts/gulim.ttc',
+            'C:/Windows/Fonts/batang.ttc'
+        ]
+    elif system == "Darwin":  # macOS
+        font_paths = [
+            '/System/Library/Fonts/AppleGothic.ttf',
+            '/Library/Fonts/AppleGothic.ttf'
+        ]
+    else:  # Linux 또는 기타
+        font_paths = [
+            '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+            '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/TTF/NanumGothic.ttf',
+            '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+        ]
+        
+        # Linux 환경에서 한글 폰트가 없으면 다운로드 시도
+        try:
+            import urllib.request
+            import tempfile
+            
+            nanum_url = "https://github.com/naver/nanumfont/raw/master/fonts/NanumGothic.ttf"
+            temp_dir = tempfile.gettempdir()
+            nanum_path = os.path.join(temp_dir, "NanumGothic.ttf")
+            
+            if not os.path.exists(nanum_path):
+                urllib.request.urlretrieve(nanum_url, nanum_path)
+            
+            font_paths.insert(0, nanum_path)
+        except Exception:
+            pass
+    
+    # 폰트 파일 찾기 및 등록
+    for font_path in font_paths:
+        try:
+            if os.path.exists(font_path):
+                pdfmetrics.registerFont(TTFont('KoreanFont', font_path))
+                return 'KoreanFont'
+        except Exception as e:
+            continue
+    
+    # 모든 폰트가 실패하면 기본 폰트 사용
+    return 'Helvetica'
+
+# 한글 폰트 설정
 try:
-    pdfmetrics.registerFont(TTFont('NanumGothic', 
-                                   'C:/Windows/Fonts/malgun.ttf'))
-    KOREAN_FONT = 'NanumGothic'
-except (OSError, FileNotFoundError):
-    KOREAN_FONT = 'Helvetica'  # 폰트가 없을 경우 기본 폰트 사용
+    KOREAN_FONT = setup_korean_font()
+    print(f"✅ 한글 폰트 설정 완료: {KOREAN_FONT}")
+except Exception as e:
+    print(f"⚠️ 한글 폰트 설정 실패: {e}")
+    KOREAN_FONT = 'Helvetica'  # 최종 대안
 
 # 페이지 설정
 st.set_page_config(
@@ -650,10 +708,13 @@ def create_pdf_download(df, title, filename):
     
     # 스타일 설정
     styles = getSampleStyleSheet()
+    # 폰트 안전성 확인
+    safe_font = KOREAN_FONT if KOREAN_FONT != 'Helvetica' else 'Helvetica'
+    
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
-        fontName=KOREAN_FONT,
+        fontName=safe_font,
         fontSize=14,
         spaceAfter=20,
         alignment=1  # 중앙 정렬
@@ -738,12 +799,12 @@ def create_pdf_download(df, title, filename):
             ('BACKGROUND', (0, 0), (-1, 0), '#4472c4'),
             ('TEXTCOLOR', (0, 0), (-1, 0), 'white'),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), KOREAN_FONT),
+            ('FONTNAME', (0, 0), (-1, 0), safe_font),
             ('FONTSIZE', (0, 0), (-1, 0), 8),  # 헤더 폰트 크기 감소
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('TOPPADDING', (0, 0), (-1, 0), 8),
             ('BACKGROUND', (0, 1), (-1, -1), '#f8f9fa'),
-            ('FONTNAME', (0, 1), (-1, -1), KOREAN_FONT),
+            ('FONTNAME', (0, 1), (-1, -1), safe_font),
             ('FONTSIZE', (0, 1), (-1, -1), 6),  # 데이터 폰트 크기 감소
             ('GRID', (0, 0), (-1, -1), 0.5, 'black'),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -761,7 +822,7 @@ def create_pdf_download(df, title, filename):
         info_style = ParagraphStyle(
             'InfoStyle',
             parent=styles['Normal'],
-            fontName=KOREAN_FONT,
+            fontName=safe_font,
             fontSize=8,
             alignment=0
         )
