@@ -83,7 +83,7 @@ except Exception as e:
 
 # 페이지 설정
 st.set_page_config(
-    page_title="관세법인우신 종합 분석 시스템(수입)",
+    page_title="관세법인우신 내부 종합 분석 시스템(수입)",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -132,6 +132,15 @@ st.markdown("""
         border-left: 4px solid #17a2b8;
         margin: 1rem 0;
     }
+    
+    .made-by {
+        text-align: center;
+        font-size: 0.8rem;
+        color: #6c757d;
+        margin-top: -1rem;
+        margin-bottom: 1.5rem;
+        font-style: italic;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -140,6 +149,20 @@ class CustomsAnalyzer:
     
     def __init__(self, df, weights=None):
         self.df = df.copy()
+        
+        # 대용량 데이터 처리 최적화
+        if len(self.df) > 20000:
+            st.warning(f"⚠️ 대용량 데이터 감지 ({len(self.df):,}개). 성능 최적화를 적용합니다.")
+            # 메모리 사용량 줄이기 위해 불필요한 컬럼 제거
+            essential_cols = [
+                '신고번호', '작성자', '납세자상호', '운송주선인상호', '무역거래처상호',
+                '신고일자', '수리일자', '입력일시', '총란수', '총규격수', '요건확인서류수',
+                '관세감면구분', '원산지증명유무', '거래구분', 'C/S검사구분', '발급 서류명'
+            ]
+            available_cols = [col for col in essential_cols if col in self.df.columns]
+            self.df = self.df[available_cols]
+            st.info(f"✅ 필수 컬럼만 사용: {len(available_cols)}개 컬럼")
+        
         # 기본 가중치 설정
         self.weights = weights or {
             'lane_weight': 1.0,
@@ -280,57 +303,93 @@ class CustomsAnalyzer:
         self.weights.update(weights)
     
     def calculate_complexity_score(self, data, group_col='신고번호'):
-        """7차원 복잡도 점수 계산 (가중치 적용)"""
-        # 신고번호별 그룹화 (중복제거)
-        decl_grouped = data.groupby(group_col).agg({
+        """7차원 복잡도 점수 계산 (가중치 적용) - 벡터화 최적화"""
+        # 성능 최적화: 신고번호가 많으면 샘플링
+        unique_declarations = data[group_col].nunique()
+        if unique_declarations > 5000:
+            # 상위 5000개 신고번호만 사용
+            top_declarations = data[group_col].value_counts().head(5000).index
+            data = data[data[group_col].isin(top_declarations)]
+            st.info(f"⚡ 복잡도 계산 최적화: 상위 5000개 신고번호 사용 (전체: {unique_declarations:,}개)")
+        
+        # 신고번호별 그룹화를 위한 기본 집계 설정
+        agg_dict = {
             '총란수': 'first',
             '총규격수': 'first', 
             '관세감면구분': 'first',
             '원산지증명유무': 'first',
-            '거래구분': 'nunique',  # 거래구분 종류 수
-            '무역거래처상호': 'nunique',  # 무역거래처 종류 수
-            '발급서류명': lambda x: x.notna().sum()  # 수입요건 수
-        }).reset_index()
+            '거래구분': 'nunique',
+            '무역거래처상호': 'nunique',
+        }
         
-        # 복잡도 계산
-        complexity_scores = []
+        # 발급서류명 컬럼이 있는 경우에만 추가
+        if '발급서류명' in data.columns:
+            agg_dict['발급서류명'] = lambda x: x.notna().sum()
+        elif '발급 서류명' in data.columns:
+            agg_dict['발급 서류명'] = lambda x: x.notna().sum()
+        elif '요건확인서류수' in data.columns:
+            agg_dict['요건확인서류수'] = 'first'
         
-        for _, row in decl_grouped.iterrows():
-            score = 0
-            
-            # 1. 총란수 (가중치 적용)
-            score += (row.get('총란수', 0) * self.weights['lane_weight']) if pd.notna(row.get('총란수', 0)) else 0
-            
-            # 2. 총규격수 (가중치 적용)
-            score += (row.get('총규격수', 0) * self.weights['spec_weight']) if pd.notna(row.get('총규격수', 0)) else 0
-            
-            # 3. 수입요건 수 (가중치 적용)
-            score += row.get('발급서류명', 0) * self.weights['requirement_weight']
-            
-            # 4. 감면 적용 (가중치 적용)
-            if pd.notna(row.get('관세감면구분')) and str(row.get('관세감면구분')).strip():
-                score += self.weights['exemption_weight']
-                
-            # 5. 원산지증명 (가중치 적용)
-            if row.get('원산지증명유무') == 'Y':
-                score += self.weights['fta_weight']
-            
-            # 6. 거래구분 종류 수 (가중치 적용)
-            score += row.get('거래구분', 1) * self.weights['transaction_weight']
-            
-            # 7. 무역거래처 종류 수 (가중치 적용)  
-            score += row.get('무역거래처상호', 1) * self.weights['trader_weight']
-            
-            complexity_scores.append(score)
+        # 신고번호별 그룹화 (중복제거)
+        decl_grouped = data.groupby(group_col).agg(agg_dict).reset_index()
         
-        return np.mean(complexity_scores) if complexity_scores else 0
+        # 벡터화된 복잡도 계산
+        scores = np.zeros(len(decl_grouped))
+        
+        # 1. 총란수 (벡터화)
+        lane_scores = decl_grouped['총란수'].fillna(0) * self.weights['lane_weight']
+        scores += lane_scores
+        
+        # 2. 총규격수 (벡터화)  
+        spec_scores = decl_grouped['총규격수'].fillna(0) * self.weights['spec_weight']
+        scores += spec_scores
+        
+        # 3. 수입요건 수 (벡터화)
+        if '발급서류명' in decl_grouped.columns:
+            req_scores = decl_grouped['발급서류명'].fillna(0) * self.weights['requirement_weight']
+        elif '발급 서류명' in decl_grouped.columns:
+            req_scores = decl_grouped['발급 서류명'].fillna(0) * self.weights['requirement_weight']
+        elif '요건확인서류수' in decl_grouped.columns:
+            req_scores = decl_grouped['요건확인서류수'].fillna(0) * self.weights['requirement_weight']
+        else:
+            req_scores = 0
+        scores += req_scores
+        
+        # 4. 관세감면 (벡터화)
+        exemption_mask = (decl_grouped['관세감면구분'].notna() & 
+                         (decl_grouped['관세감면구분'].astype(str).str.strip() != ''))
+        scores += exemption_mask * self.weights['exemption_weight']
+        
+        # 5. 원산지증명 (벡터화)
+        fta_mask = (decl_grouped['원산지증명유무'] == 'Y')
+        scores += fta_mask * self.weights['fta_weight']
+        
+        # 6. 거래구분 종류 수 (벡터화)
+        transaction_scores = decl_grouped['거래구분'].fillna(1) * self.weights['transaction_weight']
+        scores += transaction_scores
+        
+        # 7. 무역거래처 종류 수 (벡터화)
+        trader_scores = decl_grouped['무역거래처상호'].fillna(1) * self.weights['trader_weight']
+        scores += trader_scores
+        
+        return np.mean(scores) if len(scores) > 0 else 0
     
     def analyze_by_author(self):
-        """작성자별 분석 (내부 관리용)"""
+        """작성자별 분석 (내부 관리용) - 성능 최적화"""
         if '작성자' not in self.df.columns:
             return pd.DataFrame()
         
         valid_data = self.df[self.df['작성자'].notna() & (self.df['작성자'] != '')]
+        
+        # 성능 최적화: 작성자 수가 많으면 상위 50명만 분석
+        unique_authors = valid_data['작성자'].unique()
+        if len(unique_authors) > 50:
+            # 처리량 기준으로 상위 50명 선택
+            author_counts = valid_data['작성자'].value_counts()
+            top_authors = author_counts.head(50).index
+            valid_data = valid_data[valid_data['작성자'].isin(top_authors)]
+            st.info(f"⚡ 성능 최적화: 상위 50명 작성자만 분석 (전체: {len(unique_authors)}명)")
+        
         results = []
         
         for author in valid_data['작성자'].unique():
@@ -349,7 +408,21 @@ class CustomsAnalyzer:
             total_specs = decl_grouped['총규격수'].fillna(0).astype(int).sum()
             
             # 수입요건 분석
-            requirement_count = author_data[author_data['발급서류명'].notna()]['신고번호'].nunique()
+            if '발급서류명' in author_data.columns:
+                requirement_count = author_data[
+                    author_data['발급서류명'].notna()
+                ]['신고번호'].nunique()
+            elif '발급 서류명' in author_data.columns:
+                requirement_count = author_data[
+                    author_data['발급 서류명'].notna()
+                ]['신고번호'].nunique()
+            elif '요건확인서류수' in author_data.columns:
+                requirement_count = decl_grouped[
+                    decl_grouped['요건확인서류수'].notna() & 
+                    (decl_grouped['요건확인서류수'] > 0)
+                ].shape[0]
+            else:
+                requirement_count = 0
             
             # FTA 분석
             fta_count = decl_grouped[decl_grouped['원산지증명유무'] == 'Y']
@@ -409,11 +482,20 @@ class CustomsAnalyzer:
         return result_df
     
     def analyze_by_importer(self):
-        """수입자별 분석 (고객사 관리용)"""
+        """수입자별 분석 (고객사 관리용) - 성능 최적화"""
         if '납세자상호' not in self.df.columns:
             return pd.DataFrame()
         
         valid_data = self.df[self.df['납세자상호'].notna() & (self.df['납세자상호'] != '')]
+        
+        # 성능 최적화: 수입자 수가 많으면 상위 100개사만 분석
+        unique_importers = valid_data['납세자상호'].unique()
+        if len(unique_importers) > 100:
+            importer_counts = valid_data['납세자상호'].value_counts()
+            top_importers = importer_counts.head(100).index
+            valid_data = valid_data[valid_data['납세자상호'].isin(top_importers)]
+            st.info(f"⚡ 성능 최적화: 상위 100개 수입자만 분석 (전체: {len(unique_importers)}개사)")
+        
         results = []
         
         for importer in valid_data['납세자상호'].unique():
@@ -433,8 +515,29 @@ class CustomsAnalyzer:
             author_diversity = len(author_counts)
             
             # 업종 특성 분석 (발급서류 패턴)
-            document_types = importer_data[importer_data['발급서류명'].notna()]['발급서류명'].nunique()
-            requirement_rate = len(importer_data[importer_data['발급서류명'].notna()]['신고번호'].unique()) / unique_declarations * 100 if unique_declarations > 0 else 0
+            if '발급서류명' in importer_data.columns:
+                document_types = importer_data[
+                    importer_data['발급서류명'].notna()
+                ]['발급서류명'].nunique()
+                requirement_rate = (
+                    len(importer_data[
+                        importer_data['발급서류명'].notna()
+                    ]['신고번호'].unique()) / unique_declarations * 100 
+                    if unique_declarations > 0 else 0
+                )
+            elif '발급 서류명' in importer_data.columns:
+                document_types = importer_data[
+                    importer_data['발급 서류명'].notna()
+                ]['발급 서류명'].nunique()
+                requirement_rate = (
+                    len(importer_data[
+                        importer_data['발급 서류명'].notna()
+                    ]['신고번호'].unique()) / unique_declarations * 100 
+                    if unique_declarations > 0 else 0
+                )
+            else:
+                document_types = 0
+                requirement_rate = 0
             
             # FTA 및 감면 활용 분석
             fta_count = decl_grouped[decl_grouped['원산지증명유무'] == 'Y']
@@ -449,8 +552,9 @@ class CustomsAnalyzer:
                 if unique_declarations > 0 else 0
             )
             
-            # 거래구분 다양성
+            # 거래구분 다양성 및 무역거래처 분석
             transaction_types = decl_grouped['거래구분'].nunique()
+            trader_count = decl_grouped['무역거래처상호'].nunique()
             
             # 요일별 패턴
             weekday_stats = {}
@@ -472,6 +576,7 @@ class CustomsAnalyzer:
                 'FTA활용률': round(fta_rate, 1),
                 '관세감면활용률': round(exemption_rate, 1),
                 '거래구분다양성': transaction_types,
+                '무역거래처수': trader_count,
                 '평균품목수_신고서': (
                     round(total_items / unique_declarations, 1)
                     if unique_declarations > 0 else 0
@@ -490,11 +595,20 @@ class CustomsAnalyzer:
         return result_df
     
     def analyze_by_forwarder(self):
-        """운송주선인별 분석 (포워딩 관리용)"""
+        """운송주선인별 분석 (포워딩 관리용) - 성능 최적화"""
         if '운송주선인상호' not in self.df.columns:
             return pd.DataFrame()
         
         valid_data = self.df[self.df['운송주선인상호'].notna() & (self.df['운송주선인상호'] != '')]
+        
+        # 성능 최적화: 운송주선인 수가 많으면 상위 50개사만 분석
+        unique_forwarders = valid_data['운송주선인상호'].unique()
+        if len(unique_forwarders) > 50:
+            forwarder_counts = valid_data['운송주선인상호'].value_counts()
+            top_forwarders = forwarder_counts.head(50).index
+            valid_data = valid_data[valid_data['운송주선인상호'].isin(top_forwarders)]
+            st.info(f"⚡ 성능 최적화: 상위 50개 운송주선인만 분석 (전체: {len(unique_forwarders)}개사)")
+        
         results = []
         
         for forwarder in valid_data['운송주선인상호'].unique():
@@ -674,28 +788,178 @@ def create_top_entities_chart(df, entity_col, metric='총처리건수', top_n=10
     fig.update_layout(height=500, xaxis_tickangle=-45)
     return fig
 
-def create_excel_download(df, filename):
-    """엑셀 파일 다운로드 생성 (한글 깨짐 방지)"""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='분석결과')
-        # 워크시트 가져오기
-        worksheet = writer.sheets['분석결과']
-        # 컬럼 너비 자동 조정
-        for column in worksheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
+def prepare_chart_data(df, chart_type="top10", x_col=None, y_col=None):
+    """차트용 데이터 준비"""
+    try:
+        if chart_type == "top10":
+            # 상위 10개 데이터
+            if x_col and y_col and x_col in df.columns and y_col in df.columns:
+                chart_df = df.head(10)[[x_col, y_col]]
+                return {x_col: chart_df[x_col].tolist(), 
+                       y_col: chart_df[y_col].tolist()}
+        
+        elif chart_type == "complexity_distribution":
+            # 복잡도 분포
+            if '복잡도점수' in df.columns:
+                bins = [0, 50, 100, 150, 200, float('inf')]
+                labels = ['매우낮음', '낮음', '보통', '높음', '매우높음']
+                df['복잡도구간'] = pd.cut(df['복잡도점수'], bins=bins, labels=labels)
+                dist_data = df['복잡도구간'].value_counts().sort_index()
+                return {'구간': dist_data.index.tolist(), 
+                       '개수': dist_data.values.tolist()}
+        
+        elif chart_type == "weekday_pattern":
+            # 요일별 패턴 (상위 5개 엔티티)
+            weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일']
+            if all(day in df.columns for day in weekdays):
+                top5_df = df.head(5)
+                chart_data = {'요일': weekdays}
+                
+                for _, row in top5_df.iterrows():
+                    entity_name = row[df.columns[0]]  # 첫 번째 컬럼을 엔티티명으로 사용
+                    chart_data[entity_name] = [row[day] for day in weekdays]
+                
+                return chart_data
+        
+        return None
+    except Exception:
+        return None
+
+
+def create_excel_with_charts(df, filename, analysis_type="작성자"):
+    """차트가 포함된 엑셀 파일 생성"""
+    try:
+        # 기본 차트 데이터 준비
+        if analysis_type == "작성자":
+            chart_data = prepare_chart_data(df, "top10", "작성자", "복잡도점수")
+        elif analysis_type == "수입자":
+            chart_data = prepare_chart_data(df, "top10", "수입자", "총처리건수")
+        elif analysis_type == "운송주선인":
+            chart_data = prepare_chart_data(df, "top10", "운송주선인", "총처리건수")
+        else:
+            chart_data = None
+        
+        return create_excel_download(df, filename, chart_data, "bar")
+            
+    except Exception as e:
+        st.warning(f"차트 생성 중 오류: {str(e)}")
+        return create_excel_download(df, filename)
+
+
+def create_excel_download(df, filename, chart_data=None, chart_type="bar"):
+    """엑셀 파일 다운로드 생성 (한글 깨짐 방지, 차트 포함)"""
+    try:
+        output = io.BytesIO()
+        
+        # 데이터 크기가 큰 경우 상위 1000개만 처리
+        if len(df) > 1000:
+            df_export = df.head(1000)
+            st.warning(f"⚠️ 데이터가 많아 상위 1000개만 다운로드됩니다. (전체: {len(df):,}개)")
+        else:
+            df_export = df.copy()
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # 메인 데이터 시트
+            df_export.to_excel(writer, index=False, sheet_name='분석결과')
+            
+            # 워크북과 워크시트 가져오기
+            workbook = writer.book
+            worksheet = writer.sheets['분석결과']
+            
+            # 컬럼 너비 자동 조정 (간소화)
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                
+                for cell in column[:min(100, len(column))]:
+                    try:
+                        cell_length = len(str(cell.value))
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except Exception:
+                        continue
+                
+                adjusted_width = min(max_length + 2, 30)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            # 차트 데이터가 있는 경우 차트 시트 생성
+            if chart_data is not None:
                 try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            worksheet.column_dimensions[column_letter].width = adjusted_width
-    
-    output.seek(0)
-    return output.getvalue()
+                    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+                    from openpyxl.chart.label import DataLabelList
+                    
+                    # 차트용 데이터 시트 생성
+                    chart_df = pd.DataFrame(chart_data)
+                    chart_df.to_excel(writer, index=False, sheet_name='차트데이터')
+                    chart_worksheet = writer.sheets['차트데이터']
+                    
+                    # 차트 시트 생성
+                    chart_sheet = workbook.create_sheet('차트')
+                    
+                    # 차트 생성
+                    if chart_type == "pie":
+                        chart = PieChart()
+                        chart.title = "분석 결과 차트"
+                    elif chart_type == "line":
+                        chart = LineChart()
+                        chart.title = "분석 결과 차트"
+                        chart.y_axis.title = "값"
+                        chart.x_axis.title = "항목"
+                    else:  # bar chart (기본)
+                        chart = BarChart()
+                        chart.title = "분석 결과 차트"
+                        chart.y_axis.title = "값"
+                        chart.x_axis.title = "항목"
+                    
+                    # 데이터 범위 설정
+                    data_rows = len(chart_df) + 1
+                    data_cols = len(chart_df.columns)
+                    
+                    if data_cols >= 2:
+                        # 데이터 참조 설정
+                        data = Reference(chart_worksheet, 
+                                       min_col=2, max_col=data_cols,
+                                       min_row=1, max_row=data_rows)
+                        categories = Reference(chart_worksheet,
+                                             min_col=1, max_col=1,
+                                             min_row=2, max_row=data_rows)
+                        
+                        chart.add_data(data, titles_from_data=True)
+                        if chart_type != "pie":
+                            chart.set_categories(categories)
+                        
+                        # 차트 스타일 설정
+                        chart.width = 15
+                        chart.height = 10
+                        
+                        # 데이터 레이블 표시
+                        if hasattr(chart, 'dataLabels'):
+                            chart.dataLabels = DataLabelList()
+                            chart.dataLabels.showVal = True
+                        
+                        # 차트를 시트에 추가
+                        chart_sheet.add_chart(chart, "A1")
+                        
+                        # 차트 설명 추가
+                        chart_sheet['A25'] = "📊 차트 설명"
+                        chart_sheet['A26'] = f"• 데이터 개수: {len(chart_df)}개"
+                        chart_sheet['A27'] = f"• 생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        chart_sheet['A28'] = "• 관세법인 우신 종합 분석 시스템"
+                        
+                except ImportError:
+                    st.warning("⚠️ 차트 생성을 위한 라이브러리가 없습니다. 데이터만 저장됩니다.")
+                except Exception as e:
+                    st.warning(f"⚠️ 차트 생성 중 오류: {str(e)}")
+        
+        output.seek(0)
+        return output.getvalue()
+        
+    except Exception as e:
+        st.error(f"엑셀 파일 생성 중 오류가 발생했습니다: {str(e)}")
+        # 간단한 CSV 형태로 대체
+        csv_output = io.StringIO()
+        df.to_csv(csv_output, index=False, encoding='utf-8-sig')
+        return csv_output.getvalue().encode('utf-8-sig')
 
 
 def create_pdf_download(df, title, filename):
@@ -936,6 +1200,8 @@ def main():
     # 헤더
     st.markdown('<div class="main-header">🏢 관세법인 우신 종합 분석 시스템</div>', 
                 unsafe_allow_html=True)
+    st.markdown('<div class="made-by">Made by Ws 전자동</div>', 
+                unsafe_allow_html=True)
     
     # 사이드바
     with st.sidebar:
@@ -964,6 +1230,31 @@ def main():
         
         # 복잡도 점수 설정
         st.header("⚙️ 복잡도 점수 설정")
+        
+        # 공정성 설명 추가
+        with st.expander("📖 복잡도 평가의 공정성과 투명성", expanded=False):
+            st.markdown("""
+            **🎯 복잡도 평가 목적**
+            - 업무량의 정량적 측정을 통한 공정한 평가
+            - 단순 건수가 아닌 업무의 실제 난이도 반영
+            - 전문성과 경험이 필요한 업무의 가치 인정
+            
+            **⚖️ 공정성 확보 방안**
+            1. **투명한 계산식**: 모든 가중치와 계산 과정 공개
+            2. **객관적 지표**: 시스템에서 자동 추출되는 데이터만 사용
+            3. **조정 가능**: 필요시 가중치 조정으로 합의점 도출
+            4. **검증 가능**: 언제든 재계산하여 결과 확인 가능
+            
+            **📊 7차원 평가 근거**
+            - **업무량 차원** (란수, 규격수): 기본적인 처리량
+            - **전문성 차원** (요건, 감면, FTA): 법령 해석 능력
+            - **복잡성 차원** (거래구분, 거래처): 조율과 관리 능력
+            
+            **🔄 지속적 개선**
+            - 실제 업무 현황을 반영하여 가중치 조정
+            - 구성원 의견 수렴을 통한 합리적 기준 수립
+            """)
+        
         with st.expander("🔧 점수 기준 커스터마이징", expanded=False):
             st.markdown("**7차원 복잡도 가중치 설정**")
             
@@ -1114,8 +1405,9 @@ def main():
             
             if use_custom_weights:
                 st.info("💡 커스텀 가중치가 적용됩니다. 분석 결과가 실시간으로 업데이트됩니다.")
+                st.warning("⚠️ 커스텀 가중치는 파일 업로드 후 적용됩니다.")
                 
-                # 가중치 업데이트 및 분석 재실행
+                # 가중치 정보만 저장 (실제 적용은 파일 업로드 후)
                 updated_weights = {
                     'lane_weight': lane_weight,
                     'spec_weight': spec_weight,
@@ -1126,16 +1418,8 @@ def main():
                     'trader_weight': trader_weight
                 }
                 
-                analyzer.update_weights(updated_weights)
-                
-                # 분석 재실행
-                with st.spinner("🔄 커스텀 가중치로 분석을 재실행 중..."):
-                    author_df = analyzer.analyze_by_author()
-                    importer_df = analyzer.analyze_by_importer()
-                    forwarder_df = analyzer.analyze_by_forwarder()
-                    cs_df, cs_stats = analyzer.analyze_cs_inspection()
-                
-                st.success("✅ 커스텀 가중치로 분석이 완료되었습니다!")
+                st.session_state['custom_weights'] = updated_weights
+                st.success("✅ 커스텀 가중치가 저장되었습니다. 파일 업로드 시 적용됩니다!")
         
         st.markdown("---")
         st.header("📊 분석 개요")
@@ -1192,55 +1476,37 @@ def main():
     # 데이터 로딩
     try:
         with st.spinner("📊 데이터를 분석 중입니다..."):
-            # 파일 로딩 진행상황 표시
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            status_text.text("📁 엑셀 파일 읽는 중...")
+            # 파일 로딩
             df = pd.read_excel(uploaded_file)
-            progress_bar.progress(25)
             
-            status_text.text("🔧 데이터 전처리 중...")
+            # 데이터 크기가 큰 경우 경고 표시
+            if len(df) > 50000:
+                st.warning(f"⚠️ 대용량 데이터입니다 ({len(df):,}개 행). 처리에 시간이 걸릴 수 있습니다.")
             
             # 가중치 설정
-            weights = {
-                'lane_weight': lane_weight,
-                'spec_weight': spec_weight,
-                'requirement_weight': requirement_weight,
-                'exemption_weight': exemption_weight,
-                'fta_weight': fta_weight,
-                'transaction_weight': transaction_weight,
-                'trader_weight': trader_weight
-            }
+            if 'custom_weights' in st.session_state:
+                weights = st.session_state['custom_weights']
+                st.info("🔧 커스텀 가중치가 적용되었습니다!")
+            else:
+                weights = {
+                    'lane_weight': lane_weight,
+                    'spec_weight': spec_weight,
+                    'requirement_weight': requirement_weight,
+                    'exemption_weight': exemption_weight,
+                    'fta_weight': fta_weight,
+                    'transaction_weight': transaction_weight,
+                    'trader_weight': trader_weight
+                }
             
             analyzer = CustomsAnalyzer(df, weights)
-            progress_bar.progress(50)
             
-            status_text.text("📈 작성자별 분석 실행 중...")
+            # 분석 실행 (진행상황 간소화)
             author_df = analyzer.analyze_by_author()
-            progress_bar.progress(65)
-            
-            status_text.text("🏭 수입자별 분석 실행 중...")
             importer_df = analyzer.analyze_by_importer()
-            progress_bar.progress(80)
-            
-            status_text.text("🚛 운송주선인별 분석 실행 중...")
             forwarder_df = analyzer.analyze_by_forwarder()
-            progress_bar.progress(90)
-            
-            status_text.text("📋 검사구분 분석 실행 중...")
             cs_df, cs_stats = analyzer.analyze_cs_inspection()
-            progress_bar.progress(100)
-            
-            # 진행상황 완료
-            status_text.text("✅ 분석 완료!")
-            st.success("🎉 데이터 분석이 성공적으로 완료되었습니다!")
-            
-            # 잠시 후 진행상황 바 제거
-            import time
-            time.sleep(1)
-            progress_bar.empty()
-            status_text.empty()
+        
+        st.success("🎉 데이터 분석이 성공적으로 완료되었습니다!")
         
         # 데이터 검증 및 디버깅 정보 표시
         st.info(f"📊 로드된 데이터 정보: {len(df)}행, {len(df.columns)}열")
@@ -1336,6 +1602,85 @@ def main():
                 # 복잡도 분포
                 fig_dist = create_complexity_distribution(author_df, '작성자')
                 st.plotly_chart(fig_dist, use_container_width=True)
+            
+            # 복잡도 계산 공식 설명 추가
+            st.subheader("📊 복잡도 점수 계산 공식")
+            
+            col1, col2 = st.columns([3, 2])
+            
+            with col1:
+                st.markdown("""
+                **🔢 7차원 복잡도 계산 공식**
+                
+                ```
+                복잡도 점수 = (총란수 × 1.0) + (총규격수 × 0.5) + 
+                            (수입요건수 × 10.0) + (관세감면 × 10.0) +
+                            (FTA활용 × 10.0) + (거래구분수 × 5.0) + 
+                            (무역거래처수 × 5.0)
+                ```
+                
+                **📋 각 요소별 설명**
+                - **총란수**: 신고서의 총 품목 수 (기본 업무량)
+                - **총규격수**: 품목별 상세 규격 수 (세부 작업량)
+                - **수입요건수**: 필요한 허가/승인 서류 수 (전문성 요구)
+                - **관세감면**: 감면 적용 여부 (법령 전문성)
+                - **FTA활용**: 원산지증명서 활용 (국제무역 전문성)
+                - **거래구분수**: 거래유형 다양성 (업무 복잡성)
+                - **무역거래처수**: 연결된 거래처 수 (관계 관리)
+                """)
+            
+            with col2:
+                st.markdown("""
+                **⚖️ 가중치 설정 근거**
+                
+                - **기본 업무량** (1.0~0.5점)
+                  - 란수/규격수는 기본적인 업무량 지표
+                
+                - **전문성 요구** (10.0점)
+                  - 수입요건, 감면, FTA는 높은 전문성 필요
+                  - 법령 해석과 적용 능력 요구
+                
+                - **업무 복잡성** (5.0점)
+                  - 거래구분/거래처 다양성
+                  - 관계 관리와 조율 능력 필요
+                
+                **📈 점수 구간**
+                - **100점 미만**: 일반 업무
+                - **100~200점**: 중간 복잡도
+                - **200점 이상**: 고복잡도 업무
+                """)
+            
+            # 실시간 복잡도 시뮬레이터 추가
+            st.subheader("🧮 복잡도 계산 시뮬레이터")
+            
+            sim_col1, sim_col2, sim_col3 = st.columns(3)
+            
+            with sim_col1:
+                sim_lanes = st.number_input("총란수", min_value=0, max_value=100, value=10, key="sim_lanes")
+                sim_specs = st.number_input("총규격수", min_value=0, max_value=200, value=20, key="sim_specs")
+                sim_requirements = st.number_input("수입요건수", min_value=0, max_value=10, value=2, key="sim_req")
+            
+            with sim_col2:
+                sim_exemption = st.checkbox("관세감면 적용", value=True, key="sim_exemption")
+                sim_fta = st.checkbox("FTA 활용", value=False, key="sim_fta")
+                sim_transactions = st.number_input("거래구분 종류", min_value=1, max_value=10, value=2, key="sim_trans")
+            
+            with sim_col3:
+                sim_traders = st.number_input("무역거래처수", min_value=1, max_value=20, value=3, key="sim_traders")
+                
+                # 계산 결과
+                sim_score = (sim_lanes * 1.0 + sim_specs * 0.5 + sim_requirements * 10.0 + 
+                           (10.0 if sim_exemption else 0) + (10.0 if sim_fta else 0) + 
+                           sim_transactions * 5.0 + sim_traders * 5.0)
+                
+                st.metric("**계산된 복잡도**", f"{sim_score:.1f}점")
+                
+                if sim_score < 100:
+                    st.success("🟢 일반 업무 수준")
+                elif sim_score < 200:
+                    st.warning("🟡 중간 복잡도")
+                else:
+                    st.error("🔴 고복잡도 업무")
             
             # 요일별 패턴 분석
             st.subheader("📅 작성자별 요일 처리 패턴")
@@ -1574,6 +1919,27 @@ def main():
                 fig_complexity = create_complexity_distribution(importer_df, '수입자')
                 st.plotly_chart(fig_complexity, use_container_width=True)
             
+            # 복잡도 계산 공식 설명 (수입자용)
+            with st.expander("📊 고객사 복잡도 평가 기준", expanded=False):
+                st.markdown("""
+                **🏭 고객사별 복잡도 평가의 의미**
+                
+                복잡도 점수가 높은 고객사일수록:
+                - 더 많은 전문성과 경험이 필요
+                - 높은 서비스 품질 요구
+                - 맞춤형 컨설팅 서비스 필요
+                
+                **📈 고객 관리 전략**
+                - **고복잡도 고객**: 전담 전문가 배정, 프리미엄 서비스
+                - **중복잡도 고객**: 표준화된 고품질 서비스
+                - **일반 고객**: 효율적인 표준 서비스
+                
+                **💼 업종별 특성 반영**
+                - 수입요건이 많은 업종 (의료기기, 화학물질 등)
+                - FTA 활용도가 높은 업종 (제조업 등)
+                - 다양한 거래처를 보유한 종합상사
+                """)
+            
             # 고객별 특성 분석
             st.subheader("🔍 고객사별 업종 특성 분석")
             
@@ -1627,6 +1993,26 @@ def main():
                 with col3:
                     st.metric("FTA 활용률", f"{selected_importer['FTA활용률']:.1f}%")
                     st.metric("발급서류 종류", f"{selected_importer['발급서류종류수']}가지")
+            
+            # 상세 데이터 테이블
+            st.subheader("📋 수입자별 상세 현황")
+            
+            display_columns = [
+                '수입자', '총처리건수', '고유신고번호수', '복잡도점수', 
+                'FTA활용률', '관세감면활용률', '무역거래처수', '주담당작성자'
+            ]
+            
+            st.dataframe(
+                importer_df[display_columns].style.format({
+                    '총처리건수': '{:,}',
+                    '고유신고번호수': '{:,}',
+                    '복잡도점수': '{:.1f}',
+                    'FTA활용률': '{:.1f}%',
+                    '관세감면활용률': '{:.1f}%',
+                    '무역거래처수': '{:,}'
+                }),
+                use_container_width=True
+            )
             
             # 요일별 패턴
             st.subheader("📅 주요 고객사 요일별 신고 패턴")
@@ -1704,6 +2090,27 @@ def main():
                     nbins=15
                 )
                 st.plotly_chart(fig_efficiency, use_container_width=True)
+            
+            # 복잡도 계산 공식 설명 (포워더용)
+            with st.expander("📊 포워더 복잡도 평가 기준", expanded=False):
+                st.markdown("""
+                **🚛 포워더별 복잡도 평가의 의미**
+                
+                복잡도 점수가 높은 포워더일수록:
+                - 다양하고 복잡한 화물 처리 경험
+                - 높은 전문성과 네트워크 보유
+                - 까다로운 통관 업무 처리 능력
+                
+                **🤝 파트너십 전략**
+                - **고복잡도 파트너**: 전략적 핵심 파트너, 장기 협력
+                - **중복잡도 파트너**: 안정적 협력 관계 유지
+                - **일반 파트너**: 효율성 중심 협력
+                
+                **🌐 네트워크 가치**
+                - 다양한 수입자와의 연결 (네트워크 허브 역할)
+                - 복잡한 거래구조 처리 능력
+                - 국제 물류 전문성
+                """)
             
             # 포워더 효율성 분석
             st.subheader("⚡ 포워더별 처리 효율성 분석")
@@ -2008,9 +2415,13 @@ def main():
     with col1:
         if not author_df.empty:
             if download_format == "엑셀 (Excel)":
-                excel_data = create_excel_download(author_df, f"작성자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx")
+                excel_data = create_excel_with_charts(
+                    author_df, 
+                    f"작성자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    "작성자"
+                )
                 st.download_button(
-                    "👥 작성자 분석 결과 (Excel)",
+                    "👥 작성자 분석 결과 (Excel + 📊차트)",
                     excel_data,
                     f"작성자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2035,9 +2446,13 @@ def main():
     with col2:
         if not importer_df.empty:
             if download_format == "엑셀 (Excel)":
-                excel_data = create_excel_download(importer_df, f"수입자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx")
+                excel_data = create_excel_with_charts(
+                    importer_df, 
+                    f"수입자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    "수입자"
+                )
                 st.download_button(
-                    "🏭 수입자 분석 결과 (Excel)",
+                    "🏭 수입자 분석 결과 (Excel + 📊차트)",
                     excel_data,
                     f"수입자분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2062,9 +2477,13 @@ def main():
     with col3:
         if not forwarder_df.empty:
             if download_format == "엑셀 (Excel)":
-                excel_data = create_excel_download(forwarder_df, f"포워더분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx")
+                excel_data = create_excel_with_charts(
+                    forwarder_df, 
+                    f"포워더분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    "운송주선인"
+                )
                 st.download_button(
-                    "🚛 포워더 분석 결과 (Excel)",
+                    "🚛 포워더 분석 결과 (Excel + 📊차트)",
                     excel_data,
                     f"포워더분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
